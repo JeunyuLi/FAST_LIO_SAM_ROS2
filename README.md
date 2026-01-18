@@ -51,13 +51,13 @@
 6. 运行
     ```bash
     source ./install/setup.bash
-    ros2 launch fast_lio mapping.launch.py config_file:=velodyne_16.yaml
+    ros2 launch fast_lio_sam mapping.launch.py config_file:=velodyne_16.yaml
     ros2 bag play T3F2-2021-08-02-15-00-12_ros2/
     ```
 
 7. 对于mid360
     ```bash
-    ros2 launch fast_lio mapping.launch.py config_file:=mid360.yaml
+    ros2 launch fast_lio_sam mapping.launch.py config_file:=mid360.yaml
     # 引入livox的消息类型
     source /home/slam/fast_lio_sam_ros2_ws/install/setup.bash
     ros2 bag play 
