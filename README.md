@@ -14,6 +14,9 @@
         ros-humble-cv-bridge \
         ros-humble-image-transport \
         ros-humble-compressed-image-transport
+    # 安装gtsam
+    sudo add-apt-repository ppa:borglab/gtsam-release-4.1
+    sudo apt install libgtsam-dev libgtsam-unstable-dev
     ```
 2. 安装 Livox SDK2 和驱动
     ```bash
