@@ -63,17 +63,81 @@
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 
+// ros通信
+#include <std_msgs/msg/float64_multi_array.hpp>
+
+#include <Eigen/Dense>
+#include <pcl/search/impl/search.hpp>
+#include <pcl/range_image/range_image.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/common/common.h>
+#include <pcl/common/transforms.h>
+#include <pcl/registration/icp.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/filters/filter.h>
+#include <pcl/filters/crop_box.h>
+#include <pcl_conversions/pcl_conversions.h>
+
+// gstam
+#include <gtsam/geometry/Rot3.h>
+#include <gtsam/geometry/Pose3.h>
+#include <gtsam/slam/PriorFactor.h>
+#include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/navigation/GPSFactor.h>
+#include <gtsam/navigation/ImuFactor.h>
+#include <gtsam/navigation/CombinedImuFactor.h>
+#include <gtsam/nonlinear/NonlinearFactorGraph.h>
+#include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/nonlinear/Marginals.h>
+#include <gtsam/nonlinear/Values.h>
+#include <gtsam/inference/Symbol.h>
+#include <gtsam/nonlinear/ISAM2.h>
+
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
 #define PUBFRAME_PERIOD     (20)
+
+// gtsam
+gtsam::NonlinearFactorGraph gtSAMgraph;
+gtsam::Values initialEstimate;
+gtsam::Values optimizedEstimate;
+gtsam::ISAM2 *isam;
+gtsam::Values isamCurrentEstimate;
+Eigen::MatrixXd poseCovariance;
+// 选定关键帧时的阈值
+float surroundingkeyframeAddingDistThreshold;  //  判断是否为关键帧的距离阈值
+float surroundingkeyframeAddingAngleThreshold; //  判断是否为关键帧的角度阈值
+float surroundingKeyframeDensity;
+float surroundingKeyframeSearchRadius;
+/*** RTK parameter Value ***/
+float rtk_cov_threshold = 2;          //   rtk方向角和高度差的协方差阈值
+float pose_cov_threshold = 0.10;        //  位姿协方差阈值  from isam2
+struct RtkData {
+    double timestamp;                  // 时间戳
+    double x;                          // X 坐标
+    double y;                          // Y 坐标
+    double z;                          // Z 坐标
+    Eigen::Matrix3d covariance;        // 3x3 协方差矩阵
+};
+
+// ros::Publisher pubRtkPose;
+
+std::deque<RtkData> rtk_data_buffer;
+Eigen::Matrix4d T_IR = Eigen::Matrix4d::Identity();;
+std::vector<double> rotation_data(9, 0.0);
+std::vector<double> translation_data(3, 0.0);
+bool factor_graph_en = true;
+bool gps_factor_en = false;
+bool   imu_z_init_en = false, z_init_flag = false;
+M3D    z_init_rot = Eigen::Matrix3d::Identity();
 
 /*** Time Log Variables ***/
 double kdtree_incremental_time = 0.0, kdtree_search_time = 0.0, kdtree_delete_time = 0.0;
 double T1[MAXN], s_plot[MAXN], s_plot2[MAXN], s_plot3[MAXN], s_plot4[MAXN], s_plot5[MAXN], s_plot6[MAXN], s_plot7[MAXN], s_plot8[MAXN], s_plot9[MAXN], s_plot10[MAXN], s_plot11[MAXN];
 double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 int    kdtree_size_st = 0, kdtree_size_end = 0, add_point_size = 0, kdtree_delete_counter = 0;
-bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true;
+bool   runtime_pos_log = false, pcd_save_en = false, time_sync_en = false, extrinsic_est_en = true, path_en = true, sam_path_en = true;
 /**************************/
 
 float res_last[100000] = {0.0};
@@ -142,6 +206,76 @@ geometry_msgs::msg::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+/*back end*/
+vector<pcl::PointCloud<PointType>::Ptr> cornerCloudKeyFrames; // 历史所有关键帧的角点集合（降采样）
+vector<pcl::PointCloud<PointType>::Ptr> surfCloudKeyFrames;   // 历史所有关键帧的平面点集合（降采样）
+pcl::PointCloud<PointType>::Ptr cloudKeyPoses3D(new pcl::PointCloud<PointType>());         // 历史关键帧位姿（位置）
+pcl::PointCloud<PointTypePose>::Ptr cloudKeyPoses6D(new pcl::PointCloud<PointTypePose>()); // 历史关键帧位姿
+pcl::PointCloud<PointType>::Ptr copy_cloudKeyPoses3D(new pcl::PointCloud<PointType>());
+pcl::PointCloud<PointTypePose>::Ptr copy_cloudKeyPoses6D(new pcl::PointCloud<PointTypePose>());
+
+float transformTobeMapped[6] = {0.0f}; //  当前帧的位姿(world系下)
+nav_msgs::msg::Path sam_path;
+
+// voxel filter paprams
+float odometrySurfLeafSize;
+float mappingCornerLeafSize;
+float mappingSurfLeafSize;
+
+float z_tollerance;
+float rotation_tollerance;
+
+// CPU Params
+int numberOfCores = 4;
+double mappingProcessInterval;
+
+/*loop clousre*/
+bool startFlag = true;
+bool loopClosureEnableFlag;
+float loopClosureFrequency; //   回环检测频率
+int surroundingKeyframeSize;
+float historyKeyframeSearchRadius;   // 回环检测 radius kdtree搜索半径
+float historyKeyframeSearchTimeDiff; //  帧间时间阈值
+int historyKeyframeSearchNum;        //   回环时多少个keyframe拼成submap
+float historyKeyframeFitnessScore;   // icp 匹配阈值
+bool potentialLoopFlag = false;
+
+
+int ori_index = 0;  //  fastlio当前帧的index
+std::unordered_map<int, int> keyframe_to_original;
+
+bool aLoopIsClosed = false;
+map<int, int> loopIndexContainer; // from new to old
+vector<pair<int, int>> loopIndexQueue;
+vector<gtsam::Pose3> loopPoseQueue;
+vector<gtsam::noiseModel::Diagonal::shared_ptr> loopNoiseQueue;
+deque<std_msgs::msg::Float64MultiArray> loopInfoVec;
+
+// 局部关键帧构建的map点云，对应kdtree，用于scan-to-map找相邻点
+pcl::KdTreeFLANN<PointType>::Ptr kdtreeCornerFromMap(new pcl::KdTreeFLANN<PointType>());
+pcl::KdTreeFLANN<PointType>::Ptr kdtreeSurfFromMap(new pcl::KdTreeFLANN<PointType>());
+
+pcl::KdTreeFLANN<PointType>::Ptr kdtreeSurroundingKeyPoses(new pcl::KdTreeFLANN<PointType>());
+pcl::KdTreeFLANN<PointType>::Ptr kdtreeHistoryKeyPoses(new pcl::KdTreeFLANN<PointType>());
+
+// 降采样
+pcl::VoxelGrid<PointType> downSizeFilterCorner;
+// pcl::VoxelGrid<PointType> downSizeFilterSurf;
+pcl::VoxelGrid<PointType> downSizeFilterICP;
+pcl::VoxelGrid<PointType> downSizeFilterSurroundingKeyPoses; // for surrounding key poses of scan-to-map optimization
+
+std::mutex mtx;
+std::mutex mtxLoopInfo;
+
+// global map visualization radius
+float globalMapVisualizationSearchRadius;
+float globalMapVisualizationPoseDensity;
+float globalMapVisualizationLeafSize;
+
+bool recontructKdTree = false;
+int updateKdtreeCount = 0 ;        //  每100次更新一次
+bool visulize_IkdtreeMap = false;            //  visual iktree submap
 
 void SigHandle(int sig)
 {
@@ -513,7 +647,6 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
     /**************** save map ****************/
     /* 1. make sure you have enough memories
     /* 2. noted that pcd save will influence the real-time performences **/
-    /*
     if (pcd_save_en)
     {
         int size = feats_undistort->points.size();
@@ -540,7 +673,6 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
             scan_wait_num = 0;
         }
     }
-    */
 }
 
 void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body)
@@ -646,8 +778,8 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
 
     geometry_msgs::msg::TransformStamped trans;
     trans.header.frame_id = "camera_init";
+    trans.header.stamp = odomAftMapped.header.stamp;
     trans.child_frame_id = "body";
-    trans.header.stamp = get_ros_time(lidar_end_time);
     trans.transform.translation.x = odomAftMapped.pose.pose.position.x;
     trans.transform.translation.y = odomAftMapped.pose.pose.position.y;
     trans.transform.translation.z = odomAftMapped.pose.pose.position.z;
@@ -672,6 +804,24 @@ void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
         path.poses.push_back(msg_body_pose);
         pubPath->publish(path);
     }
+}
+
+void publish_sam_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubSamPath)
+{
+    set_posestamp(msg_body_pose);
+
+
+    /*** if path is too large, the rvis will crash ***/
+    static int kkk = 0;
+    kkk++;
+    if (kkk % 10 == 0) 
+    {
+        sam_path.header.stamp = get_ros_time(lidar_end_time); // ros::Time().fromSec(lidar_end_time);
+        sam_path.header.frame_id = "camera_init";
+        pubSamPath->publish(sam_path);
+    }
+
+
 }
 
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
@@ -792,6 +942,136 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     }
     solve_time += omp_get_wtime() - solve_start_;
 }
+/**
+ * 两点间距离计算
+*/
+float pointDistance(PointType p1, PointType p2)
+{
+    return sqrt(pow(p1.x - p2.x, 2) + pow(p1.y - p2.y, 2) + pow(p1.z - p2.z, 2));
+}
+
+
+void updateSamPath(const PointTypePose &pose_in)
+{
+    string odometryFrame = "camera_init";
+
+    // 创建 PoseStamped消息
+    geometry_msgs::msg::PoseStamped pose_stamped;
+
+    // 设置时间戳 （ROS2方式）
+    pose_stamped.header.stamp = rclcpp::Time(pose_in.time * 1e9); // TODO: 确认时间戳
+    pose_stamped.header.frame_id = odometryFrame;
+
+    // 将位置信息转换为Eigen向量
+    Eigen::Vector3d original_position(pose_in.x, pose_in.y, pose_in.z);
+
+    // 位置旋转变换
+    Eigen::Vector3d rotated_position = z_init_rot * original_position;
+
+    // 更新后的位置信息
+    pose_stamped.pose.position.x = rotated_position.x();
+    pose_stamped.pose.position.y = rotated_position.y();
+    pose_stamped.pose.position.z = rotated_position.z();
+
+    // 姿态旋转变换
+    // 欧拉角转四元数
+    Eigen::Quaterniond quaternion =  Eigen::AngleAxisd(pose_in.yaw, Eigen::Vector3d::UnitZ())
+                                   * Eigen::AngleAxisd(pose_in.pitch, Eigen::Vector3d::UnitY())
+                                   * Eigen::AngleAxisd(pose_in.roll, Eigen::Vector3d::UnitX());
+
+    // 四元数转旋转矩阵
+    Eigen::Matrix3d rotated_matrix = quaternion.toRotationMatrix();
+
+    // 融合旋转矩阵
+    Eigen::Matrix3d rotated_attitude = z_init_rot * rotated_matrix;
+
+    // 旋转矩阵转四元数
+    Eigen::Quaterniond q(rotated_attitude);
+
+    pose_stamped.pose.orientation.x = q.x();
+    pose_stamped.pose.orientation.y = q.y();
+    pose_stamped.pose.orientation.z = q.z();
+    pose_stamped.pose.orientation.w = q.w();
+
+    // 更新全局路径
+    sam_path.poses.push_back(pose_stamped);
+}
+
+/* 欧拉角 → 四元数 */
+Eigen::Quaterniond EulerToQuat(float roll_, float pitch_, float yaw_)
+{
+    Eigen::Quaterniond q; // 四元数 q 和 -q是相等的
+    Eigen::AngleAxisd roll(double(roll_), Eigen::Vector3d::UnitX());
+    Eigen::AngleAxisd pitch(double(pitch_), Eigen::Vector3d::UnitY());
+    Eigen::AngleAxisd yaw(double(yaw_), Eigen::Vector3d::UnitZ());
+    q = yaw * pitch * roll;
+    q.normalize();
+    return q;
+}
+
+/* 位姿格式变换：PointTypePose → gtsam::Pose3 */
+gtsam::Pose3 pclPointTogtsamPose3(PointTypePose thisPoint)
+{
+    double roll = static_cast<double>(thisPoint.roll);
+    double pitch = static_cast<double>(thisPoint.pitch);
+    double yaw = static_cast<double>(thisPoint.yaw);
+    double x = static_cast<double>(thisPoint.x);
+    double y = static_cast<double>(thisPoint.y);
+    double z = static_cast<double>(thisPoint.z);
+
+    return gtsam::Pose3(gtsam::Rot3::RzRyRx(roll, pitch, yaw),
+                        gtsam::Point3(x, y, z));
+}
+
+/* 位姿格式变换：float数组 → gtsam::Pose3 */
+gtsam::Pose3 trans2gtsamPose(float transformIn[])
+{
+    return gtsam::Pose3(gtsam::Rot3::RzRyRx(transformIn[0], transformIn[1], transformIn[2]),
+                        gtsam::Point3(transformIn[3], transformIn[4], transformIn[5]));
+}
+
+/* 位姿格式变换：PointTypePose → Eigen::Affine3f */
+Eigen::Affine3f pclPointToAffine3f(PointTypePose thisPoint)
+{
+    return pcl::getTransformation(thisPoint.x, thisPoint.y, thisPoint.z, thisPoint.roll, thisPoint.pitch, thisPoint.yaw);
+}
+
+/* 位姿格式变换：float数组 → Eigen::Affine3f */
+Eigen::Affine3f trans2Affine3f(float transformIn[])
+{
+    return pcl::getTransformation(transformIn[3], transformIn[4], transformIn[5], transformIn[0], transformIn[1], transformIn[2]);
+}
+
+/* 位姿格式变换：float数组 → PointTypePose */
+PointTypePose trans2PointTypePose(float transformIn[])
+{
+    PointTypePose thisPose6D;
+    thisPose6D.x = transformIn[3];
+    thisPose6D.y = transformIn[4];
+    thisPose6D.z = transformIn[5];
+    thisPose6D.roll = transformIn[0];
+    thisPose6D.pitch = transformIn[1];
+    thisPose6D.yaw = transformIn[2];
+    return thisPose6D;
+}
+
+/* 判断矩阵是否近似单位阵 */
+bool is_identity_with_tolerance(const Eigen::Matrix4d& mat, double tolerance = 1e-6) {
+    // 判断矩阵是否接近单位矩阵
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            if ((i == j && std::fabs(mat(i, j) - 1) > tolerance) || 
+                (i != j && std::fabs(mat(i, j)) > tolerance)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+
+
 
 class LaserMappingNode : public rclcpp::Node
 {
@@ -799,6 +1079,7 @@ public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
         this->declare_parameter<bool>("publish.path_en", true);
+        this->declare_parameter<bool>("publish.sam_path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
         this->declare_parameter<bool>("publish.scan_publish_en", true);
@@ -833,8 +1114,36 @@ public:
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
         this->declare_parameter<vector<double>>("mapping.extrinsic_R", vector<double>());
+        // // 声明新加的参数
+        this->declare_parameter<float>("voxel_filter_paprams.odometrySurfLeafSize", 0.2);
+        this->declare_parameter<float>("voxel_filter_paprams.mappingCornerLeafSize", 0.2);
+        this->declare_parameter<float>("voxel_filter_paprams.mappingSurfLeafSize", 0.2);
+        this->declare_parameter<float>("robot_motion_constraint.z_tollerance", std::numeric_limits<float>::max());
+        this->declare_parameter<float>("robot_motion_constraint.rotation_tollerance", std::numeric_limits<float>::max());
+        this->declare_parameter<int>("cpu_params.numberOfCores", 2);
+        this->declare_parameter<double>("cpu_params.mappingProcessInterval", 0.15);
+        this->declare_parameter<float>("surrounding_map.surroundingkeyframeAddingDistThreshold", 20.0);
+        this->declare_parameter<float>("surrounding_map.surroundingkeyframeAddingAngleThreshold", 0.2);
+        this->declare_parameter<float>("surrounding_map.surroundingKeyframeDensity", 1.0);
+        this->declare_parameter<float>("surrounding_map.surroundingKeyframeSearchRadius", 50.0);
+        this->declare_parameter<bool>("factor_graph.factor_graph_en", false);
+        this->declare_parameter<bool>("lc.loopClosureEnableFlag", false);
+        this->declare_parameter<float>("lc.loopClosureFrequency", 1.0);
+        this->declare_parameter<int>("lc.surroundingKeyframeSize", 50);
+        this->declare_parameter<float>("lc.historyKeyframeSearchRadius", 10.0);
+        this->declare_parameter<float>("lc.historyKeyframeSearchTimeDiff", 30.0);
+        this->declare_parameter<int>("lc.historyKeyframeSearchNum", 25);
+        this->declare_parameter<float>("lc.historyKeyframeFitnessScore", 0.3);
+        // 声明可视化相关参数
+        this->declare_parameter<float>("visualize.globalMapVisualizationSearchRadius", 1e3);
+        this->declare_parameter<float>("visualize.globalMapVisualizationPoseDensity", 10.0);
+        this->declare_parameter<float>("visualize.globalMapVisualizationLeafSize", 1.0);
+        this->declare_parameter<bool>("iktree.visulize_IkdtreeMap", false);
+        this->declare_parameter<bool>("iktree.recontructKdTree", false);
+
 
         this->get_parameter_or<bool>("publish.path_en", path_en, true);
+        this->get_parameter_or<bool>("publish.sam_path_en", sam_path_en, true);
         this->get_parameter_or<bool>("publish.effect_map_en", effect_pub_en, false);
         this->get_parameter_or<bool>("publish.map_en", map_pub_en, false);
         this->get_parameter_or<bool>("publish.scan_publish_en", scan_pub_en, true);
@@ -872,8 +1181,46 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
+        // // 新加的一些参数，使用get_parameter_or获取参数，如果没有设置则使用默认值
+        this->get_parameter_or<float>("voxel_filter_paprams.odometrySurfLeafSize", odometrySurfLeafSize, 0.2);
+        this->get_parameter_or<float>("voxel_filter_paprams.mappingCornerLeafSize", mappingCornerLeafSize, 0.2);
+        this->get_parameter_or<float>("voxel_filter_paprams.mappingSurfLeafSize", mappingSurfLeafSize, 0.2);
+        this->get_parameter_or<float>("robot_motion_constraint.z_tollerance", z_tollerance, std::numeric_limits<float>::max());
+        this->get_parameter_or<float>("robot_motion_constraint.rotation_tollerance", rotation_tollerance, std::numeric_limits<float>::max());
+        this->get_parameter_or<int>("cpu_params.numberOfCores", numberOfCores, 2);
+        this->get_parameter_or<double>("cpu_params.mappingProcessInterval", mappingProcessInterval, 0.15);
+        this->get_parameter_or<float>("surrounding_map.surroundingkeyframeAddingDistThreshold", surroundingkeyframeAddingDistThreshold, 20.0);
+        this->get_parameter_or<float>("surrounding_map.surroundingkeyframeAddingAngleThreshold", surroundingkeyframeAddingAngleThreshold, 0.2);
+        this->get_parameter_or<float>("surrounding_map.surroundingKeyframeDensity", surroundingKeyframeDensity, 1.0);
+        this->get_parameter_or<float>("surrounding_map.surroundingKeyframeSearchRadius", surroundingKeyframeSearchRadius, 50.0);
+        this->get_parameter_or<bool>("factor_graph.factor_graph_en", factor_graph_en, false);
+        this->get_parameter_or<bool>("lc.loopClosureEnableFlag", loopClosureEnableFlag, false);
+        this->get_parameter_or<float>("lc.loopClosureFrequency", loopClosureFrequency, 1.0);
+        this->get_parameter_or<int>("lc.surroundingKeyframeSize", surroundingKeyframeSize, 50);
+        this->get_parameter_or<float>("lc.historyKeyframeSearchRadius", historyKeyframeSearchRadius, 10.0);
+        this->get_parameter_or<float>("lc.historyKeyframeSearchTimeDiff", historyKeyframeSearchTimeDiff, 30.0);
+        this->get_parameter_or<int>("lc.historyKeyframeSearchNum", historyKeyframeSearchNum, 25);
+        this->get_parameter_or<float>("lc.historyKeyframeFitnessScore", historyKeyframeFitnessScore, 0.3);
+        // 获取可视化参数值
+        this->get_parameter_or<float>("visualize.globalMapVisualizationSearchRadius", globalMapVisualizationSearchRadius, 1e3);
+        this->get_parameter_or<float>("visualize.globalMapVisualizationPoseDensity", globalMapVisualizationPoseDensity, 10.0);
+        this->get_parameter_or<float>("visualize.globalMapVisualizationLeafSize", globalMapVisualizationLeafSize, 1.0);
+        this->get_parameter_or<bool>("iktree.visulize_IkdtreeMap", visulize_IkdtreeMap, false);
+        this->get_parameter_or<bool>("iktree.recontructKdTree", recontructKdTree, false);
+
         path.header.stamp = this->get_clock()->now();
         path.header.frame_id ="camera_init";
+
+        downSizeFilterCorner.setLeafSize(mappingCornerLeafSize, mappingCornerLeafSize, mappingCornerLeafSize);
+        // downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
+        downSizeFilterICP.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
+        downSizeFilterSurroundingKeyPoses.setLeafSize(surroundingKeyframeDensity, surroundingKeyframeDensity, surroundingKeyframeDensity); // for surrounding key poses of scan-to-map optimization
+
+        // ISAM2参数 
+        gtsam::ISAM2Params parameters;
+        parameters.relinearizeThreshold = 0.01;
+        parameters.relinearizeSkip = 1;
+        isam = new gtsam::ISAM2(parameters);
 
         // /*** variables definition ***/
         // int effect_feat_num = 0, frame_num = 0;
@@ -933,6 +1280,7 @@ public:
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
+        pubSamPath_ = this->create_publisher<nav_msgs::msg::Path>("/sam_path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
         //------------------------------------------------------------------------------------------------------
@@ -944,6 +1292,18 @@ public:
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
+        // 回环检测定时器
+        if (loopClosureEnableFlag) {
+            auto loop_period = std::chrono::duration<double>(1.0 / loopClosureFrequency);
+            loop_closure_timer_ = rclcpp::create_timer(
+                this,
+                this->get_clock(),
+                std::chrono::duration_cast<std::chrono::nanoseconds>(loop_period),
+                std::bind(&LaserMappingNode::performLoopClosure, this)
+            );
+            RCLCPP_INFO(this->get_logger(), "Loop closure timer created with frequency: %f Hz", loopClosureFrequency);
+        }
+        
         RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
@@ -953,6 +1313,508 @@ public:
         fout_pre.close();
         fclose(fp);
     }
+
+// 和回环检测有关的函数
+private:
+    /* 计算当前帧与前一帧位姿变换，若变化太小则不设为关键帧 */
+    bool saveKeyframe()
+    {
+        // 保存初始帧
+        if (cloudKeyPoses3D->points.empty())
+            return true;
+        // 前一帧位姿
+        Eigen::Affine3f pre_pose = pclPointToAffine3f(cloudKeyPoses6D->back());
+        // 当前帧位姿
+        Eigen::Affine3f cur_pose = trans2Affine3f(transformTobeMapped);
+
+        // 位置变换增量
+        Eigen::Affine3f trans = pre_pose.inverse() * cur_pose;
+        float x, y, z, roll, pitch, yaw;
+        pcl::getTranslationAndEulerAngles(trans, x, y, z, roll, pitch, yaw); // 获取上一帧位姿相对当前帧位姿的变换
+        
+        // 旋转和平移量小于阈值则不设为关键帧
+        if (abs(roll) < surroundingkeyframeAddingAngleThreshold && 
+            abs(pitch) < surroundingkeyframeAddingAngleThreshold && 
+            abs(yaw) < surroundingkeyframeAddingAngleThreshold && 
+            sqrt(x * x + y * y + z * z) < surroundingkeyframeAddingDistThreshold)
+            return false;
+        // 记录关键帧的索引index
+        keyframe_to_original[cloudKeyPoses3D->points.size()] = ori_index;
+        return true;
+    }
+
+    //回环检测三大要素
+    // 1.设置最小时间差，太近没必要
+    // 2.控制回环的频率，避免频繁检测，每检测一次，就做一次等待
+    // 3.根据当前最小距离重新计算等待时间
+    bool detectLoopClosureDistance(int *latestID, int *closestID)
+    {
+        // RCLCPP_INFO(this->get_logger(), "Loop detection started.");
+        // 当前关键帧
+        int loopKeyCur = copy_cloudKeyPoses3D->size() - 1;
+        int loopKeyPre = -1;
+
+        // 当前帧已经添加过闭环对应关系，不再继续添加
+        auto it = loopIndexContainer.find(loopKeyCur);
+        if (it != loopIndexContainer.end())
+            return false;
+        // 在历史关键帧中查找与当前帧距离最近的关键帧集合
+        std::vector<int> pointSearchIndLoop; // 存储最近邻关键帧索引
+        std::vector<float> pointSearchSqDisLoop; // 存储最近邻关键帧距离
+        kdtreeHistoryKeyPoses->setInputCloud(copy_cloudKeyPoses3D); // 历史关键帧构建kdtree
+        kdtreeHistoryKeyPoses->radiusSearch(copy_cloudKeyPoses3D->back(), historyKeyframeSearchRadius, pointSearchIndLoop, pointSearchSqDisLoop, 0); 
+        // 在候选关键帧集合，找到与当前帧时间间隔较远的关键帧，设为匹配帧
+        for (int i = 0; i < (int)pointSearchIndLoop.size(); ++i)
+        {
+            int id = pointSearchIndLoop[i]; 
+            if (abs(copy_cloudKeyPoses6D->points[id].time - lidar_end_time) > historyKeyframeSearchTimeDiff)
+            {
+                loopKeyPre = id;
+                break;
+            }
+        }
+        if (loopKeyPre == -1 || loopKeyCur == loopKeyPre)
+            return false;
+        *latestID = loopKeyCur;
+        *closestID = loopKeyPre;
+        RCLCPP_INFO(this->get_logger(), "Find loop clousre frame: %d - %d", loopKeyPre, loopKeyCur);
+        return true;
+    }
+
+    // 提取key索引的关键帧前后相邻若干帧的关键帧特征点集合，降采样
+    void loopFindNearKeyframes(pcl::PointCloud<PointType>::Ptr &nearKeyframes, const int &key, const int &searchNum)
+    {
+        // 提取key索引的关键帧前后相邻若干帧的关键帧特征点集合
+        nearKeyframes->clear();
+        int cloudSize = copy_cloudKeyPoses6D->size();
+        auto surfcloud_keyframes_size = surfCloudKeyFrames.size();
+        for (int i = -searchNum; i <= searchNum; ++i)
+        {
+            int keyNear = key + i;
+            if (keyNear < 0 || keyNear >= cloudSize)
+                continue;
+            if (keyNear < 0 || keyNear >= surfcloud_keyframes_size)
+                continue;
+            
+            // 注意：cloudKeyPoses6D 存储的是 T_w_b , 而点云是lidar系下的，构建icp的submap时，需要通过外参数T_b_lidar 转换 , 参考pointBodyToWorld 的转换
+            *nearKeyframes += *transformPointCloud(surfCloudKeyFrames[keyNear], &copy_cloudKeyPoses6D->points[keyNear]);
+        }
+
+        if (nearKeyframes->empty())
+            return;
+        // 降采样
+        pcl::PointCloud<PointType>::Ptr cloud_temp(new pcl::PointCloud<PointType>());
+        downSizeFilterICP.setInputCloud(nearKeyframes);
+        downSizeFilterICP.filter(*cloud_temp);
+        *nearKeyframes = *cloud_temp;
+    }
+
+    void performLoopClosure()
+    {
+        rclcpp::Time timeLaserInfoStamp = rclcpp::Time(lidar_end_time * 1e9); // TODO: 检查是不是需要转换为纳秒
+        string odometryFrame = "camera_init";
+
+        if (cloudKeyPoses3D->points.empty())
+            return;
+        
+        mtx.lock();
+        *copy_cloudKeyPoses3D = *cloudKeyPoses3D;
+        *copy_cloudKeyPoses6D = *cloudKeyPoses6D;
+        mtx.unlock();
+
+        // 当前关键帧索引，候选闭环匹配帧索引
+        int loopKeyCur;
+        int loopKeyPre;
+        // 在历史关键帧中查找与当前关键帧距离最近的关键帧集合，选择时间相隔较远的一帧作为候选闭环帧
+        if (!detectLoopClosureDistance(&loopKeyCur, &loopKeyPre))
+        {
+            return;
+        }   
+        // 提取
+        pcl::PointCloud<PointType>::Ptr cureKeyframeCloud(new pcl::PointCloud<PointType>()); // cue keyframe
+        pcl::PointCloud<PointType>::Ptr prevKeyframeCloud(new pcl::PointCloud<PointType>()); // history keyframe submap
+        {
+            // 提取当前关键帧特征点集合，降采样
+            loopFindNearKeyframes(cureKeyframeCloud, loopKeyCur, 0); // 将cur keyframe 转换到world系下
+            // 提取闭环匹配关键帧前后相邻若干帧的关键帧特征点集合，降采样
+            loopFindNearKeyframes(prevKeyframeCloud, loopKeyPre, historyKeyframeSearchNum); // 
+            // 发布闭环匹配关键帧局部map
+            // if (pubHistoryKeyFrames.getNumSubscribers() != 0)
+            //     publishCloud(&pubHistoryKeyFrames, prevKeyframeCloud, timeLaserInfoStamp, odometryFrame);
+        }
+        // ICP Settings
+        pcl::IterativeClosestPoint<PointType, PointType> icp;
+        icp.setMaxCorrespondenceDistance(150); // giseop , use a value can cover 2*historyKeyframeSearchNum range in meter
+        icp.setMaximumIterations(100);
+        icp.setTransformationEpsilon(1e-6);
+        icp.setEuclideanFitnessEpsilon(1e-6);
+        icp.setRANSACIterations(0);
+
+        // scan-to-map，调用icp匹配
+        icp.setInputSource(cureKeyframeCloud);
+        icp.setInputTarget(prevKeyframeCloud);
+        pcl::PointCloud<PointType>::Ptr unused_result(new pcl::PointCloud<PointType>());
+        icp.align(*unused_result);
+
+        // 未收敛，或者匹配不够好
+        if (icp.hasConverged() == false || icp.getFitnessScore() > historyKeyframeFitnessScore)
+        {
+            RCLCPP_INFO(this->get_logger(), "未收敛，或者匹配不够好");
+            return;
+        }
+        
+        std::cout << "icp success; icp fitness score " << icp.getFitnessScore() << endl;
+
+        // 发布当前关键帧经过闭环优化后的位姿变换只会的特征点云
+        // if (pubIcpKeyFrames.getNumSubscribers() != 0)
+        // {
+        //     pcl::PointCloud<PointType>::Ptr closed_cloud(new pcl::PointCloud<PointType>());
+        //     pcl::transformPointCloud(*cureKeyframeCloud, *closed_cloud, icp.getFinalTransformation());
+        //     publishCloud(&pubIcpKeyFrames, closed_cloud, timeLaserInfoStamp, odometryFrame);
+        // }
+
+        // 闭环优化得到的当前关键帧与闭环匹配关键帧之间的位姿变换
+        float x, y, z, roll, pitch, yaw;
+        Eigen::Affine3f correctionLidarFrame;
+        correctionLidarFrame = icp.getFinalTransformation();
+
+        // 闭环优化前当前帧的位姿
+        Eigen::Affine3f tWrong = pclPointToAffine3f(copy_cloudKeyPoses6D->points[loopKeyCur]);
+        // // 闭环优化后的当前帧的位姿
+        Eigen::Affine3f tCorrect = correctionLidarFrame * tWrong;
+        pcl::getTranslationAndEulerAngles(tCorrect, x, y, z, roll, pitch, yaw);// 获取上一帧相对当前帧的位置
+        gtsam::Pose3 poseFrom = gtsam::Pose3(gtsam::Rot3::RzRyRx(roll, pitch, yaw), gtsam::Point3(x, y, z));
+        // 闭环匹配帧的位姿
+        gtsam::Pose3 poseTo = pclPointTogtsamPose3(copy_cloudKeyPoses6D->points[loopKeyPre]);
+        gtsam::Vector Vector6(6);
+        float noiseScore = icp.getFitnessScore(); // 闭环icp 噪声
+        Vector6 << noiseScore, noiseScore, noiseScore, noiseScore, noiseScore, noiseScore;
+        gtsam::noiseModel::Diagonal::shared_ptr constraintNoise = gtsam::noiseModel::Diagonal::Variances(Vector6);
+        std::cout << "loopNoiseQueue   =   " << noiseScore << std::endl;
+
+        // 添加闭环因子需要的数据
+        mtx.lock();
+        loopIndexQueue.push_back(make_pair(loopKeyCur, loopKeyPre));
+        loopPoseQueue.push_back(poseFrom.between(poseTo));
+        loopNoiseQueue.push_back(constraintNoise);
+        mtx.unlock();
+
+        loopIndexContainer[loopKeyCur] = loopKeyPre; // 使用hash map 存储回环对
+    }
+
+// 和图优化有关的函数
+private:
+    //添加激光里程计因子
+    void add_odom_factor()
+    {
+        if(cloudKeyPoses3D->points.empty())
+        {
+            // 先验因子
+            gtsam::noiseModel::Diagonal::shared_ptr priorNoise = gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) <<1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12).finished()); // rad*rad, meter*meter   // indoor 1e-12, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12    //  1e-2, 1e-2, M_PI*M_PI, 1e8, 1e8, 1e8
+            gtSAMgraph.add(gtsam::PriorFactor<gtsam::Pose3>(0, trans2gtsamPose(transformTobeMapped), priorNoise));
+            // 变量节点设置初值
+            initialEstimate.insert(0, trans2gtsamPose(transformTobeMapped));
+        }
+        else
+        {
+            // 添加激光里程计因子
+            gtsam::noiseModel::Diagonal::shared_ptr odometryNoise = gtsam::noiseModel::Diagonal::Variances((gtsam::Vector(6) << 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4).finished());
+            gtsam::Pose3 prevPose = pclPointTogtsamPose3(cloudKeyPoses6D->points.back());
+            gtsam::Pose3 currPose = trans2gtsamPose(transformTobeMapped);
+            // 参数：前一帧id，当前帧id，前一帧位姿，当前帧位姿，噪声协方差
+            gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(cloudKeyPoses3D->size() - 1, cloudKeyPoses3D->size(), prevPose.between(currPose), odometryNoise));
+            // 节点设置初始值
+            initialEstimate.insert(cloudKeyPoses3D->size(), currPose); 
+        }
+    }
+
+    void add_loop_factor()
+    {
+        if (loopIndexQueue.empty())
+            return;
+
+        // 验证三个队列大小一致性
+        if (loopPoseQueue.size() != loopIndexQueue.size() || loopNoiseQueue.size() != loopIndexQueue.size()) {
+            RCLCPP_ERROR(this->get_logger(), "Loop queue sizes are inconsistent!");
+            return;
+        }
+
+        RCLCPP_INFO(this->get_logger(), "Adding Loop Constraints...");
+
+        // 闭环队列
+        for (int i = 0; i < (int)loopIndexQueue.size(); ++i)
+        {
+            // 闭环边对应两帧的索引
+            int indexFrom = loopIndexQueue[i].first;
+            int indexTo = loopIndexQueue[i].second;
+            // 闭环边的位姿变换
+            gtsam::Pose3 poseBetween = loopPoseQueue[i];
+            gtsam::noiseModel::Diagonal::shared_ptr noiseModelBetween = loopNoiseQueue[i];
+            gtSAMgraph.add(gtsam::BetweenFactor<gtsam::Pose3>(indexFrom, indexTo, poseBetween, noiseModelBetween));
+            // 回环因子只加入了闭环边，没有加入节点，不需要初始化值
+        }
+
+        loopIndexQueue.clear();
+        loopPoseQueue.clear();
+        loopNoiseQueue.clear();
+        aLoopIsClosed = true;
+
+    }
+
+    void factor_optimization()
+    {
+        if (saveKeyframe() == false)
+            return;
+        
+        // RCLCPP_INFO(this->get_logger(), "Save keyframe...");
+        // 添加激光里程计因子
+        add_odom_factor();
+        // 添加闭环因子
+        add_loop_factor();
+        
+        // 执行优化
+        isam->update(gtSAMgraph, initialEstimate);
+        isam->update();
+
+        if (aLoopIsClosed == true)
+        {
+            isam->update();
+            isam->update();
+            isam->update();
+            isam->update();
+            isam->update();
+        }
+        // update之后要清空一下保存的因子图，注：历史数据不会清掉，ISAM保存起来了
+        gtSAMgraph.resize(0);
+        initialEstimate.clear();
+
+        PointType thisPose3D;
+        PointTypePose thisPose6D;
+        gtsam::Pose3 latestEstimate;
+
+        // 优化结果
+        isamCurrentEstimate = isam->calculateEstimate();
+        // 当前帧位姿结果
+        latestEstimate = isamCurrentEstimate.at<gtsam::Pose3>(isamCurrentEstimate.size()-1);
+        // cloudKeyPoses3D加入当前帧位置
+        thisPose3D.x = latestEstimate.translation().x();
+        thisPose3D.y = latestEstimate.translation().y();
+        thisPose3D.z = latestEstimate.translation().z();
+        // 索引
+        thisPose3D.intensity = cloudKeyPoses3D->size(); // 使用intensity作为该帧点云的index
+        cloudKeyPoses3D->push_back(thisPose3D); // 新关键帧放入队列中
+
+        // cloudKeyPoses6D加入当前帧位姿
+        thisPose6D.x = thisPose3D.x;
+        thisPose6D.y = thisPose3D.y;
+        thisPose6D.z = thisPose3D.z;
+        thisPose6D.intensity = thisPose3D.intensity;
+        thisPose6D.roll = latestEstimate.rotation().roll();
+        thisPose6D.pitch = latestEstimate.rotation().pitch();
+        thisPose6D.yaw = latestEstimate.rotation().yaw();
+        thisPose6D.time = lidar_end_time;
+        cloudKeyPoses6D->push_back(thisPose6D);
+
+        // 位姿协方差
+        poseCovariance = isam->marginalCovariance(isamCurrentEstimate.size() - 1);
+
+        // ESKF状态和方差 更新
+        state_ikfom state_updated = kf.get_x(); // 获取cur_pose (还没修正)
+        Eigen::Vector3d pos(latestEstimate.translation().x(), latestEstimate.translation().y(), latestEstimate.translation().z());
+        Eigen::Quaterniond q = EulerToQuat(latestEstimate.rotation().roll(), latestEstimate.rotation().pitch(), latestEstimate.rotation().yaw());
+
+        // 更新状态量
+        state_updated.pos = pos;
+        state_updated.rot = q;
+        state_point = state_updated; // 对state_point进行更新，state_point可视化用到
+        kf.change_x(state_updated); //  对cur_pose 进行isam2优化后的修正
+        // 当前帧激光焦点、平面点，降采样集合
+        pcl::PointCloud<PointType>::Ptr thisSurfKeyFrame(new pcl::PointCloud<PointType>());
+        pcl::copyPointCloud(*feats_undistort, *thisSurfKeyFrame); // 存储关键帧,没有降采样的点云
+
+        // 保存特征点降采样集合
+        surfCloudKeyFrames.push_back(thisSurfKeyFrame);
+
+        updateSamPath(thisPose6D); // 可视化update后的path
+        
+    }
+
+    /* 将 state_ikfom 当前位姿赋给 transformTobeMapped */
+    void update_curpose(state_ikfom cur_state)
+    {
+        //  欧拉角是没有群的性质，所以从SO3还是一般的rotation matrix 转换过来的结果一样
+        Eigen::Vector3d eulerAngle = cur_state.rot.matrix().eulerAngles(2,1,0);        //  yaw pitch roll  单位：弧度    
+        transformTobeMapped[0] = eulerAngle(2);                // roll  使用 eulerAngles(2,1,0) 方法时，顺序是 ypr
+        transformTobeMapped[1] = eulerAngle(1);                // pitch
+        transformTobeMapped[2] = eulerAngle(0);                // yaw
+        transformTobeMapped[3] = cur_state.pos(0);          // x
+        transformTobeMapped[4] = cur_state.pos(1);          // y
+        transformTobeMapped[5] = cur_state.pos(2);          // z
+    }
+
+    void correctPoses()
+    {
+        if (cloudKeyPoses3D -> points.empty())
+            return;
+        
+        if (aLoopIsClosed == true)
+        {
+            RCLCPP_INFO(this->get_logger(), "Correcting poses...");
+            // 清空里程计轨迹
+            sam_path.poses.clear();
+            // 更新因子图中所有变量节点的位姿，也就是所有历史关键帧的位姿
+            int numPoses = isamCurrentEstimate.size();
+            for (int i = 0; i < numPoses; ++i)
+            {
+                cloudKeyPoses3D -> points[i].x = isamCurrentEstimate.at<gtsam::Pose3>(i).translation().x();
+                cloudKeyPoses3D -> points[i].y = isamCurrentEstimate.at<gtsam::Pose3>(i).translation().y();
+                cloudKeyPoses3D -> points[i].z = isamCurrentEstimate.at<gtsam::Pose3>(i).translation().z();
+
+                cloudKeyPoses6D -> points[i].x = cloudKeyPoses3D->points[i].x;
+                cloudKeyPoses6D -> points[i].y = cloudKeyPoses3D->points[i].y;
+                cloudKeyPoses6D -> points[i].z = cloudKeyPoses3D->points[i].z;
+                cloudKeyPoses6D -> points[i].roll = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().roll();
+                cloudKeyPoses6D -> points[i].pitch = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().pitch();
+                cloudKeyPoses6D -> points[i].yaw = isamCurrentEstimate.at<gtsam::Pose3>(i).rotation().yaw();
+
+                // 更新里程计轨迹
+                updateSamPath(cloudKeyPoses6D->points[i]);
+
+            }
+            // 清空局部map， reconstruct  ikdtree submap
+            recontructIKdTree();
+            // ROS_INFO("ISMA2 Update");
+            aLoopIsClosed = false;
+        }
+    }
+
+// 重构ikd树
+private:
+    // 将点云从激光雷达坐标系变换到世界坐标系，变换过程为：
+    pcl::PointCloud<PointType>::Ptr transformPointCloud(pcl::PointCloud<PointType>::Ptr cloudIn, PointTypePose *transformIn)
+    {
+        // 输入验证
+        if (!cloudIn || cloudIn->empty() || !transformIn) {
+            // RCLCPP_WARN(this->get_logger(), "Invalid input to transformPointCloud");
+            return pcl::PointCloud<PointType>::Ptr(new pcl::PointCloud<PointType>());
+        }
+
+        // 创建输出点云并预分配内存
+        pcl::PointCloud<PointType>::Ptr cloudOut(new pcl::PointCloud<PointType>());
+        const int cloudSize = cloudIn->size();
+        cloudOut->resize(cloudSize);
+
+        // 获取激光雷达到机器人体的外参变换矩阵
+        // T_b_lidar 表示从激光雷达坐标系到机器人体坐标系的变换
+        Eigen::Isometry3d T_b_lidar = Eigen::Isometry3d::Identity();
+        T_b_lidar.linear() = state_point.offset_R_L_I.matrix();      // 旋转部分
+        T_b_lidar.translation() = state_point.offset_T_L_I;          // 平移部分
+
+        // 构建世界坐标系到机器人体坐标系的变换矩阵
+        // transformIn 提供了位置(x,y,z)和姿态(roll,pitch,yaw)信息
+        Eigen::Affine3f T_w_b_affine = pcl::getTransformation(
+            transformIn->x, transformIn->y, transformIn->z,
+            transformIn->roll, transformIn->pitch, transformIn->yaw
+        );
+        
+        // 转换为双精度的Isometry3d类型
+        Eigen::Isometry3d T_w_b = Eigen::Isometry3d::Identity();
+        T_w_b.matrix() = T_w_b_affine.matrix().cast<double>();
+
+        // 计算总变换矩阵：从激光雷达到世界坐标系的变换
+        // T_w_lidar = T_w_b * T_b_lidar
+        // 即：世界坐标系 = 体坐标系 * (体坐标系到激光雷达坐标系的逆变换)
+        Eigen::Isometry3d T_w_lidar = T_w_b * T_b_lidar;
+
+        // 使用OpenMP并行处理点云变换，提高计算效率
+        // 注意：需要确保numberOfCores变量已定义
+        #pragma omp parallel for num_threads(omp_get_max_threads())
+        for (int i = 0; i < cloudSize; ++i)
+        {
+            const auto &pointFrom = cloudIn->points[i];
+            
+            // 应用齐次变换矩阵进行坐标变换
+            // 使用变换矩阵的线性部分和平移部分进行计算
+            const double x = pointFrom.x;
+            const double y = pointFrom.y;
+            const double z = pointFrom.z;
+            
+            // 计算变换后的坐标
+            cloudOut->points[i].x = T_w_lidar(0, 0) * x + T_w_lidar(0, 1) * y + T_w_lidar(0, 2) * z + T_w_lidar(0, 3);
+            cloudOut->points[i].y = T_w_lidar(1, 0) * x + T_w_lidar(1, 1) * y + T_w_lidar(1, 2) * z + T_w_lidar(1, 3);
+            cloudOut->points[i].z = T_w_lidar(2, 0) * x + T_w_lidar(2, 1) * y + T_w_lidar(2, 2) * z + T_w_lidar(2, 3);
+            
+            // 保留原始强度信息
+            cloudOut->points[i].intensity = pointFrom.intensity;
+        }
+        
+        return cloudOut;
+    }
+
+    /**
+     * @brief 重建IKD树，用于局部地图管理
+     * 
+     * 此函数根据当前关键帧周围的一定半径内查找关键帧，
+     * 并将这些关键帧的点云合并后重建IKD树，用于后续的地图匹配
+     */
+    void recontructIKdTree(){
+        if(recontructKdTree  &&  updateKdtreeCount >  0){
+            /*** if path is too large, the rvis will crash ***/
+            pcl::KdTreeFLANN<PointType>::Ptr kdtreeGlobalMapPoses(new pcl::KdTreeFLANN<PointType>());
+            pcl::PointCloud<PointType>::Ptr subMapKeyPoses(new pcl::PointCloud<PointType>());
+            pcl::PointCloud<PointType>::Ptr subMapKeyPosesDS(new pcl::PointCloud<PointType>());
+            pcl::PointCloud<PointType>::Ptr subMapKeyFrames(new pcl::PointCloud<PointType>());
+            pcl::PointCloud<PointType>::Ptr subMapKeyFramesDS(new pcl::PointCloud<PointType>());
+
+            // kdtree查找最近一帧关键帧相邻的关键帧集合
+            std::vector<int> pointSearchIndGlobalMap;
+            std::vector<float> pointSearchSqDisGlobalMap;
+            mtx.lock();
+            kdtreeGlobalMapPoses->setInputCloud(cloudKeyPoses3D);
+            kdtreeGlobalMapPoses->radiusSearch(cloudKeyPoses3D->back(), globalMapVisualizationSearchRadius, pointSearchIndGlobalMap, pointSearchSqDisGlobalMap, 0);
+            mtx.unlock();
+
+            for (int i = 0; i < (int)pointSearchIndGlobalMap.size(); ++i)
+                subMapKeyPoses->push_back(cloudKeyPoses3D->points[pointSearchIndGlobalMap[i]]);     //  subMap的pose集合
+            // 降采样
+            pcl::VoxelGrid<PointType> downSizeFilterSubMapKeyPoses;
+            downSizeFilterSubMapKeyPoses.setLeafSize(globalMapVisualizationPoseDensity, globalMapVisualizationPoseDensity, globalMapVisualizationPoseDensity); // for global map visualization
+            downSizeFilterSubMapKeyPoses.setInputCloud(subMapKeyPoses);
+            downSizeFilterSubMapKeyPoses.filter(*subMapKeyPosesDS);         //  subMap poses  downsample
+            // 提取局部相邻关键帧对应的特征点云，然后合并
+            for (int i = 0; i < (int)subMapKeyPosesDS->size(); ++i)
+            {
+                // 距离过大
+                if (pointDistance(subMapKeyPosesDS->points[i], cloudKeyPoses3D->back()) > globalMapVisualizationSearchRadius)
+                        continue;
+                int thisKeyInd = (int)subMapKeyPosesDS->points[i].intensity;
+                // *globalMapKeyFrames += *transformPointCloud(cornerCloudKeyFrames[thisKeyInd],  &cloudKeyPoses6D->points[thisKeyInd]);
+                *subMapKeyFrames += *transformPointCloud(surfCloudKeyFrames[thisKeyInd], &cloudKeyPoses6D->points[thisKeyInd]); //  fast_lio only use  surfCloud
+            }
+            // 降采样，发布
+            pcl::VoxelGrid<PointType> downSizeFilterGlobalMapKeyFrames;                                                                                   // for global map visualization
+            downSizeFilterGlobalMapKeyFrames.setLeafSize(globalMapVisualizationLeafSize, globalMapVisualizationLeafSize, globalMapVisualizationLeafSize); // for global map visualization
+            downSizeFilterGlobalMapKeyFrames.setInputCloud(subMapKeyFrames);
+            downSizeFilterGlobalMapKeyFrames.filter(*subMapKeyFramesDS);
+
+            // std::cout << "subMapKeyFramesDS sizes  =  "   << subMapKeyFramesDS->points.size()  << std::endl;
+            
+            ikdtree.reconstruct(subMapKeyFramesDS->points);
+            updateKdtreeCount = 0;
+            // ROS_INFO("Reconstructed  ikdtree ");
+            int featsFromMapNum = ikdtree.validnum();
+            kdtree_size_st = ikdtree.size();
+            // std::cout << "featsFromMapNum  =  "   << featsFromMapNum   <<  "\t" << " kdtree_size_st   =  "  <<  kdtree_size_st  << std::endl;
+        }
+            updateKdtreeCount ++ ; 
+    }
+
+// 和闭环检测有关的参数
+
+
+// 和图优化有关的参数
+private:
+
 
 private:
     void timer_callback()
@@ -1060,6 +1922,14 @@ private:
 
             double t_update_end = omp_get_wtime();
 
+            /*back end add rtk constrain*/
+            if (factor_graph_en)
+            {
+                update_curpose(state_point);   // 更新当前位姿
+                factor_optimization();
+                correctPoses();
+            }  
+
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
 
@@ -1070,6 +1940,7 @@ private:
             
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath_);
+            if (sam_path_en)        publish_sam_path(pubSamPath_);
             if (scan_pub_en)      publish_frame_world(pubLaserCloudFull_);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body_);
             if (effect_pub_en) publish_effect_world(pubLaserCloudEffect_);
@@ -1135,6 +2006,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubSamPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
@@ -1142,6 +2014,8 @@ private:
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr map_pub_timer_;
+    // 用来做回环检测的定时器
+    rclcpp::TimerBase::SharedPtr loop_closure_timer_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr map_save_srv_;
 
     bool effect_pub_en = false, map_pub_en = false;

@@ -122,6 +122,15 @@ typedef struct {
   uint8_t tag;        /**< Livox point tag   */
   uint8_t line;       /**< Laser line id     */
 } LivoxPointXyzrtl;
+
+typedef struct {
+  float x;            /**< X axis, Unit:m */
+  float y;            /**< Y axis, Unit:m */
+  float z;            /**< Z axis, Unit:m */
+  float intensity;    /**< Intensity   */
+  uint8_t tag;        /**< Livox point tag   */
+  uint8_t line;       /**< Laser line id     */
+} LivoxPointXyzitl;
 }
 POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
     (float, x, x)
@@ -131,6 +140,37 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzrtl,
     (uint8_t, tag, tag)
     (uint8_t, line, line)
 )
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(livox_ros::LivoxPointXyzitl,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, intensity, intensity)
+    (uint8_t, tag, tag)
+    (uint8_t, line, line)
+)
+
+/**
+ * 6D位姿点云结构定义
+*/
+struct PointXYZIRPYT
+{
+    PCL_ADD_POINT4D     
+    PCL_ADD_INTENSITY;  
+    float roll;         
+    float pitch;
+    float yaw;
+    double time;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW   
+} EIGEN_ALIGN16;                    
+
+POINT_CLOUD_REGISTER_POINT_STRUCT (PointXYZIRPYT,
+                                   (float, x, x) (float, y, y)
+                                   (float, z, z) (float, intensity, intensity)
+                                   (float, roll, roll) (float, pitch, pitch) (float, yaw, yaw)
+                                   (double, time, time))
+typedef PointXYZIRPYT  PointTypePose;
+
 
 class Preprocess
 {
