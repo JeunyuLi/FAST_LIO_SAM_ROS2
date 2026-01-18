@@ -60,6 +60,13 @@
     ros2 bag play 
     ```
 
+## ROS1 to ROS2
+1. rosbag的转换
+   ```bash
+   pip install rosbags==0.10.10 # 目前0.11版本的有点问题
+   rosbags-convert --src ros1bag.bag --dst ros2bag/
+   ```
+
 
 ## Acknowledgment
 感谢[FAST_LIO2](https://github.com/hku-mars/FAST_LIO2)，[FAST_LIO2_ROS2](https://github.com/Ericsii/FAST_LIO_ROS2)，[FAST_LIO_SAM](https://github.com/kahowang/FAST_LIO_SAM) 的工作
