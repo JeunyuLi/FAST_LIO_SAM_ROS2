@@ -1,4 +1,6 @@
 build
+install
+log
 Log/*.png
 Log/*.txt
 Log/*.csv
